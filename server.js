@@ -36,7 +36,7 @@ io.on('connection', (socket) => {
             device: peerInfo.device || 'Browser',
             icon: peerInfo.icon || '💻'
         };
-        
+
         peers.set(socket.id, peer);
         // console.log(`Peer registered: ${peer.name} (${socket.id})`);
 
@@ -94,7 +94,8 @@ io.on('connection', (socket) => {
         // console.log(`File accepted by ${socket.id}`);
         io.to(data.senderId).emit('file-accepted', {
             receiverId: socket.id,
-            transferId: data.transferId
+            transferId: data.transferId,
+            resOffset: data.resOffset || 0
         });
     });
 
@@ -113,7 +114,7 @@ io.on('connection', (socket) => {
         // console.log(`User disconnected: ${socket.id}`);
         const peer = peers.get(socket.id);
         peers.delete(socket.id);
-        
+
         // Notify all other peers
         socket.broadcast.emit('peer-left', {
             id: socket.id,
