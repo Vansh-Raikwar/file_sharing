@@ -320,7 +320,12 @@ class FileSharingApp {
                     const existingChunks = await this.storage.getProgress(metadata.transferId);
                     const resOffset = existingChunks * this.CHUNK_SIZE;
 
-                    this.incomingChunks.set(metadata.transferId, { metadata, receivedSize: resOffset });
+                    this.incomingChunks.set(metadata.transferId, {
+                        metadata,
+                        receivedSize: resOffset,
+                        savedChunks: existingChunks,
+                        completed: false
+                    });
 
                     if (!this.transfers.find(t => t.id === metadata.transferId)) {
                         this.transfers.push({
@@ -354,22 +359,35 @@ class FileSharingApp {
     }
 
     async processChunk(transferId, chunkData, incoming) {
+        if (incoming.completed) return;
+
         const currentOffset = incoming.receivedSize;
         incoming.receivedSize += chunkData.byteLength;
         const chunkIndex = Math.floor(currentOffset / this.CHUNK_SIZE);
+
         await this.storage.saveChunk(transferId, chunkIndex, chunkData);
+        incoming.savedChunks++;
 
         const progress = (incoming.receivedSize / incoming.metadata.size) * 100;
         this.updateTransferProgress(transferId, progress);
 
-        if (incoming.receivedSize >= incoming.metadata.size) {
-            const chunks = await this.storage.getChunks(transferId);
-            const blob = new Blob(chunks, { type: incoming.metadata.type });
-            this.downloadFile(blob, incoming.metadata.name);
-            this.updateTransferStatus(transferId, 'completed');
-            this.showNotification('Transfer Complete', `Received ${incoming.metadata.name}`);
-            await this.storage.deleteChunks(transferId);
-            this.incomingChunks.delete(transferId);
+        // Check completion using both size and chunk count for maximum reliability
+        const totalExpectedChunks = Math.ceil(incoming.metadata.size / this.CHUNK_SIZE);
+        if (incoming.receivedSize >= incoming.metadata.size && incoming.savedChunks >= totalExpectedChunks) {
+            incoming.completed = true;
+            try {
+                const chunks = await this.storage.getChunks(transferId);
+                const blob = new Blob(chunks, { type: incoming.metadata.type });
+                this.downloadFile(blob, incoming.metadata.name);
+                this.updateTransferStatus(transferId, 'completed');
+                this.showNotification('Transfer Complete', `Received ${incoming.metadata.name}`);
+                await this.storage.deleteChunks(transferId);
+                this.incomingChunks.delete(transferId);
+            } catch (error) {
+                console.error('Error assembling file:', error);
+                incoming.completed = false; // Allow retry or error state
+                this.updateTransferStatus(transferId, 'error');
+            }
         }
     }
 
@@ -404,7 +422,13 @@ class FileSharingApp {
         if (!channel || channel.readyState !== 'open') return;
 
         const signature = btoa(file.name + file.size + (file.lastModified || '')).substring(0, 24);
-        const transferId = signature;
+        let transferId = signature;
+
+        // Ensure unique ID for concurrent transfers of identical files
+        let counter = 1;
+        while (this.transfers.find(t => t.id === transferId) || this.pendingTransfers.has(transferId)) {
+            transferId = `${signature}-${counter++}`;
+        }
 
         this.socket.emit('file-metadata', { targetId: peerId, fileName: file.name, fileSize: file.size, fileType: file.type, transferId });
 
