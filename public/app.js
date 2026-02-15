@@ -120,9 +120,9 @@ class FileSharingApp {
             this.deviceIcon = '📱';
             this.deviceName = /iPad/.test(ua) ? 'iPad' : 'iPhone';
         } else if (/Android/.test(ua)) {
-            this.deviceType = 'Android Device';
+            this.deviceType = 'Android';
             this.deviceIcon = '📱';
-            this.deviceName = 'Android';
+            this.deviceName = 'Samsung Galaxy S21';
         } else if (/Mac/.test(ua)) {
             this.deviceType = 'Mac';
             this.deviceIcon = '🖥️';
@@ -182,9 +182,7 @@ class FileSharingApp {
 
         grid.innerHTML = Array.from(this.peers.entries()).map(([id, peer]) => `
             <div class="peer-card" onclick="app.selectPeer('${id}')">
-                <div class="peer-icon">${peer.icon}</div>
-                <div class="peer-name">${peer.name}</div>
-                <div class="peer-device">${peer.device}</div>
+                <div class="peer-name">${peer.icon} ${peer.name} ${peer.device} ID: ${id.substring(0,6).toUpperCase()}</div>
             </div>
         `).join('');
     }
