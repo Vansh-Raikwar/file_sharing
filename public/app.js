@@ -250,7 +250,7 @@ class FileSharingApp {
         }
         grid.innerHTML = Array.from(this.peers.entries()).map(([id, peer]) => `
             <div class="peer-card" onclick="app.selectPeer('${id}')">
-                <div class="peer-name">${peer.icon} ${peer.name} (${peer.device})</div>
+                <div class="peer-name">ID: ${id.substring(0, 6).toUpperCase()} | ${peer.name}</div>
             </div>
         `).join('');
     }
@@ -505,7 +505,8 @@ class FileSharingApp {
         items.innerHTML = this.transfers.map(t => {
             const peer = this.peers.get(t.peerId);
             const statusLabel = t.status === 'completed' ? '✓ Complete' : t.status === 'error' ? '✗ Failed' : t.status === 'waiting' ? '⏳ Waiting' : (t.direction === 'outgoing' ? '↻ Sending' : '↻ Receiving');
-            return `<div class="transfer-item"><div class="transfer-info"><div class="transfer-name">${t.fileName}</div><div class="transfer-status">${statusLabel} ${t.direction === 'outgoing' ? 'to' : 'from'} ${peer ? peer.name : 'Device'} (${this.formatFileSize(t.fileSize)})</div><div class="transfer-progress"><div class="transfer-progress-bar" style="width: ${t.progress}%"></div></div></div></div>`;
+            const peerName = peer ? `ID: ${t.peerId.substring(0, 6).toUpperCase()} | ${peer.name}` : 'Device';
+            return `<div class="transfer-item"><div class="transfer-info"><div class="transfer-name">${t.fileName}</div><div class="transfer-status">${statusLabel} ${t.direction === 'outgoing' ? 'to' : 'from'} ${peerName} (${this.formatFileSize(t.fileSize)})</div><div class="transfer-progress"><div class="transfer-progress-bar" style="width: ${t.progress}%"></div></div></div></div>`;
         }).join('');
     }
 
@@ -525,9 +526,10 @@ class FileSharingApp {
         if (this.incomingQueue.length === 0) return;
         const data = this.incomingQueue[0];
         const peer = this.peers.get(data.senderId);
+        const peerInfo = peer ? `ID: ${data.senderId.substring(0, 6).toUpperCase()} | ${peer.name}` : 'Unknown device';
         const modal = document.createElement('div');
         modal.className = 'modal';
-        modal.innerHTML = `<div class="modal-content"><div class="modal-title">📥 Incoming File</div><p><strong>${peer ? peer.name : 'Unknown'}</strong> wants to send ${data.fileName}</p><div class="modal-buttons"><button class="btn btn-danger" id="rejectBtn">Decline</button><button class="btn btn-secondary" id="acceptAllBtn" style="display: ${this.incomingQueue.length > 1 ? 'block' : 'none'}">Accept All</button><button class="btn btn-primary" id="acceptBtn">Accept</button></div></div>`;
+        modal.innerHTML = `<div class="modal-content"><div class="modal-title">📥 Incoming File</div><p><strong>${peerInfo}</strong> wants to send ${data.fileName}</p><div class="modal-buttons"><button class="btn btn-danger" id="rejectBtn">Decline</button><button class="btn btn-secondary" id="acceptAllBtn" style="display: ${this.incomingQueue.length > 1 ? 'block' : 'none'}">Accept All</button><button class="btn btn-primary" id="acceptBtn">Accept</button></div></div>`;
         document.body.appendChild(modal);
         this.activeModal = modal;
 
