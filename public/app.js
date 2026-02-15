@@ -1,3 +1,101 @@
+class Storage {
+    constructor() {
+        this.dbName = 'FileSharingDB';
+        this.dbVersion = 1;
+        this.db = null;
+    }
+
+    async init() {
+        return new Promise((resolve, reject) => {
+            const request = indexedDB.open(this.dbName, this.dbVersion);
+            request.onerror = () => reject(request.error);
+            request.onsuccess = () => {
+                this.db = request.result;
+                resolve();
+            };
+            request.onupgradeneeded = (event) => {
+                const db = event.target.result;
+                if (!db.objectStoreNames.contains('chunks')) {
+                    db.createObjectStore('chunks', { keyPath: 'id' });
+                }
+            };
+        });
+    }
+
+    async saveChunk(transferId, chunkIndex, data) {
+        return new Promise((resolve, reject) => {
+            const transaction = this.db.transaction(['chunks'], 'readwrite');
+            const store = transaction.objectStore('chunks');
+            const id = `${transferId}-${chunkIndex}`;
+            store.put({ id, transferId, chunkIndex, data });
+            transaction.oncomplete = () => resolve();
+            transaction.onerror = () => reject(transaction.error);
+        });
+    }
+
+    async getChunks(transferId) {
+        return new Promise((resolve, reject) => {
+            const transaction = this.db.transaction(['chunks'], 'readonly');
+            const store = transaction.objectStore('chunks');
+            const request = store.openCursor();
+            const chunks = [];
+            request.onsuccess = (event) => {
+                const cursor = event.target.result;
+                if (cursor) {
+                    if (cursor.value.transferId === transferId) {
+                        chunks.push(cursor.value);
+                    }
+                    cursor.continue();
+                } else {
+                    resolve(chunks.sort((a, b) => a.chunkIndex - b.chunkIndex).map(c => c.data));
+                }
+            };
+            request.onerror = () => reject(request.error);
+        });
+    }
+
+    async deleteChunks(transferId) {
+        return new Promise((resolve, reject) => {
+            const transaction = this.db.transaction(['chunks'], 'readwrite');
+            const store = transaction.objectStore('chunks');
+            const request = store.openCursor();
+            request.onsuccess = (event) => {
+                const cursor = event.target.result;
+                if (cursor) {
+                    if (cursor.value.transferId === transferId) {
+                        store.delete(cursor.key);
+                    }
+                    cursor.continue();
+                } else {
+                    resolve();
+                }
+            };
+            request.onerror = () => reject(request.error);
+        });
+    }
+
+    async getProgress(transferId) {
+        return new Promise((resolve, reject) => {
+            const transaction = this.db.transaction(['chunks'], 'readonly');
+            const store = transaction.objectStore('chunks');
+            const request = store.openCursor();
+            let count = 0;
+            request.onsuccess = (event) => {
+                const cursor = event.target.result;
+                if (cursor) {
+                    if (cursor.value.transferId === transferId) {
+                        count++;
+                    }
+                    cursor.continue();
+                } else {
+                    resolve(count);
+                }
+            };
+            request.onerror = () => reject(request.error);
+        });
+    }
+}
+
 class FileSharingApp {
     constructor() {
         this.socket = null;
@@ -9,7 +107,10 @@ class FileSharingApp {
         this.selectedPeer = null;
         this.pendingTransfers = new Map(); // Pending file acceptance
         this.activeModal = null;
-        
+        this.storage = new Storage();
+        this.incomingChunks = new Map(); // transferId -> { metadata, receivedSize }
+        this.incomingQueue = []; // Queue for incoming file modals
+
         // WebRTC configuration
         this.rtcConfig = {
             iceServers: [
@@ -25,7 +126,8 @@ class FileSharingApp {
         this.init();
     }
 
-    init() {
+    async init() {
+        await this.storage.init();
         this.connectToSignalingServer();
         this.setupFileHandling();
         this.detectDevice();
@@ -96,7 +198,7 @@ class FileSharingApp {
             const transfer = this.pendingTransfers.get(data.transferId);
             if (transfer) {
                 this.showNotification('Transfer Starting', `${transfer.fileName} accepted`);
-                this.startFileTransfer(transfer);
+                this.startFileTransfer(transfer, data.resOffset || 0);
                 this.pendingTransfers.delete(data.transferId);
             }
         });
@@ -114,7 +216,7 @@ class FileSharingApp {
 
     detectDevice() {
         const ua = navigator.userAgent;
-        
+
         if (/iPhone|iPad|iPod/.test(ua)) {
             this.deviceType = 'iOS Device';
             this.deviceIcon = '📱';
@@ -141,7 +243,7 @@ class FileSharingApp {
     updateStatus(connected) {
         const statusDot = document.getElementById('statusDot');
         const statusText = document.getElementById('statusText');
-        
+
         if (connected) {
             statusDot.classList.remove('offline');
             statusText.textContent = 'Connected';
@@ -166,7 +268,7 @@ class FileSharingApp {
 
     renderPeers() {
         const grid = document.getElementById('peersGrid');
-        
+
         if (this.peers.size === 0) {
             grid.innerHTML = `
                 <div class="empty-state">
@@ -182,19 +284,19 @@ class FileSharingApp {
 
         grid.innerHTML = Array.from(this.peers.entries()).map(([id, peer]) => `
             <div class="peer-card" onclick="app.selectPeer('${id}')">
-                <div class="peer-name">${peer.icon} ${peer.name} ${peer.device} ID: ${id.substring(0,6).toUpperCase()}</div>
+                <div class="peer-name">${peer.icon} ${peer.name} ${peer.device} ID: ${id.substring(0, 6).toUpperCase()}</div>
             </div>
         `).join('');
     }
 
     async selectPeer(peerId) {
         this.selectedPeer = peerId;
-        
+
         // Establish WebRTC connection if not already connected
         if (!this.connections.has(peerId)) {
             await this.createConnection(peerId);
         }
-        
+
         // Trigger file selection
         const fileInput = document.getElementById('fileInput');
         fileInput.click();
@@ -220,7 +322,7 @@ class FileSharingApp {
             const dataChannel = pc.createDataChannel('fileTransfer', {
                 ordered: true
             });
-            
+
             this.setupDataChannel(dataChannel, peerId);
             this.dataChannels.set(peerId, dataChannel);
 
@@ -304,42 +406,66 @@ class FileSharingApp {
             console.log('Data channel opened with', peerId);
         };
 
-        channel.onmessage = (event) => {
+        channel.onmessage = async (event) => {
             if (typeof event.data === 'string') {
-                // File metadata
-                fileMetadata = JSON.parse(event.data);
-                receivedBuffer = [];
-                receivedSize = 0;
-                transferAccepted = false;
-                
-                console.log('Received file metadata:', fileMetadata);
-                
-            } else {
-                // File chunk - only process if transfer was accepted
-                if (!transferAccepted && fileMetadata) {
-                    // First chunk - this means transfer was accepted on the UI
-                    transferAccepted = true;
+                const message = JSON.parse(event.data);
+
+                if (message.type === 'metadata') {
+                    const metadata = message.data;
+                    console.log('Received file metadata:', metadata);
+
+                    // Check for existing progress
+                    const existingChunks = await this.storage.getProgress(metadata.transferId);
+                    const resOffset = existingChunks * this.CHUNK_SIZE;
+
+                    this.incomingChunks.set(metadata.transferId, {
+                        metadata,
+                        receivedSize: resOffset
+                    });
+
+                    // Add to transfer list if not there (for resumption)
+                    if (!this.transfers.find(t => t.id === metadata.transferId)) {
+                        this.transfers.push({
+                            id: metadata.transferId,
+                            fileName: metadata.name,
+                            fileSize: metadata.size,
+                            fileType: metadata.type,
+                            peerId,
+                            progress: (resOffset / metadata.size) * 100,
+                            status: 'receiving',
+                            direction: 'incoming'
+                        });
+                        this.renderTransfers();
+                    }
                 }
-                
-                receivedBuffer.push(event.data);
-                receivedSize += event.data.byteLength;
+            } else {
+                // Handle binary chunk (multiplexed)
+                const view = new DataView(event.data);
+                const idLength = view.getUint8(0);
+                const decoder = new TextDecoder();
+                const transferId = decoder.decode(event.data.slice(1, 1 + idLength));
+                const chunkData = event.data.slice(1 + idLength);
 
-                if (fileMetadata) {
-                    const progress = (receivedSize / fileMetadata.size) * 100;
-                    this.updateTransferProgress(fileMetadata.transferId, progress);
+                const incoming = this.incomingChunks.get(transferId);
+                if (incoming) {
+                    const chunkIndex = Math.floor(incoming.receivedSize / this.CHUNK_SIZE);
+                    await this.storage.saveChunk(transferId, chunkIndex, chunkData);
 
-                    if (receivedSize >= fileMetadata.size) {
+                    incoming.receivedSize += chunkData.byteLength;
+                    const progress = (incoming.receivedSize / incoming.metadata.size) * 100;
+                    this.updateTransferProgress(transferId, progress);
+
+                    if (incoming.receivedSize >= incoming.metadata.size) {
                         // File complete
-                        const blob = new Blob(receivedBuffer, { type: fileMetadata.type });
-                        this.downloadFile(blob, fileMetadata.name);
-                        this.updateTransferStatus(fileMetadata.transferId, 'completed');
-                        this.showNotification('Transfer Complete', `Received ${fileMetadata.name}`);
-                        
+                        const chunks = await this.storage.getChunks(transferId);
+                        const blob = new Blob(chunks, { type: incoming.metadata.type });
+                        this.downloadFile(blob, incoming.metadata.name);
+                        this.updateTransferStatus(transferId, 'completed');
+                        this.showNotification('Transfer Complete', `Received ${incoming.metadata.name}`);
+
                         // Clean up
-                        receivedBuffer = [];
-                        receivedSize = 0;
-                        fileMetadata = null;
-                        transferAccepted = false;
+                        await this.storage.deleteChunks(transferId);
+                        this.incomingChunks.delete(transferId);
                     }
                 }
             }
@@ -410,20 +536,22 @@ class FileSharingApp {
         }
 
         for (const file of files) {
-            await this.sendFile(file, this.selectedPeer);
+            this.sendFile(file, this.selectedPeer);
         }
     }
 
     async sendFile(file, peerId) {
         const channel = this.dataChannels.get(peerId);
-        
+
         if (!channel || channel.readyState !== 'open') {
             this.showNotification('Connection Error', 'Not connected to peer');
             return;
         }
 
-        // Generate unique transfer ID
-        const transferId = Date.now() + '-' + Math.random().toString(36).substr(2, 9);
+        // Generate unique signature for resumption (name + size)
+        // Add timestamp to ensure unique ID even if same file is sent 
+        const signature = btoa(file.name + file.size).substring(0, 16);
+        const transferId = signature + '-' + Date.now().toString(36);
 
         // Notify recipient about incoming file (requires acceptance)
         this.socket.emit('file-metadata', {
@@ -453,7 +581,7 @@ class FileSharingApp {
         this.renderTransfers();
     }
 
-    async startFileTransfer(transfer) {
+    async startFileTransfer(transfer, startOffset = 0) {
         const { file, channel, id: transferId } = transfer;
 
         // Update status
@@ -461,21 +589,29 @@ class FileSharingApp {
 
         // Send metadata via data channel
         const metadata = {
-            name: file.name,
-            size: file.size,
-            type: file.type,
-            transferId: transferId
+            type: 'metadata',
+            data: {
+                name: file.name,
+                size: file.size,
+                type: file.type,
+                transferId: transferId
+            }
         };
         channel.send(JSON.stringify(metadata));
 
-        // Send file in larger chunks (64KB for better performance with large files)
+        // Send file in larger chunks (64KB)
         const chunkSize = this.CHUNK_SIZE;
-        let offset = 0;
-        const totalChunks = Math.ceil(file.size / chunkSize);
-        let chunksSent = 0;
+        let offset = startOffset;
 
-        // Use FileReader for better memory management with large files
         const sendNextChunk = () => {
+            if (transfer.status === 'error' || transfer.status === 'completed') return;
+
+            // Flow control: Wait if buffer is too full
+            if (channel.bufferedAmount > 1024 * 1024) { // 1MB threshold
+                setTimeout(sendNextChunk, 50);
+                return;
+            }
+
             if (offset >= file.size) {
                 this.updateTransferStatus(transferId, 'completed');
                 this.showNotification('Transfer Complete', `${file.name} sent successfully`);
@@ -487,26 +623,25 @@ class FileSharingApp {
 
             reader.onload = (e) => {
                 try {
-                    channel.send(e.target.result);
-                    offset += e.target.result.byteLength;
-                    chunksSent++;
+                    const encoder = new TextEncoder();
+                    const idBytes = encoder.encode(transferId);
+                    const chunkData = new Uint8Array(e.target.result);
+
+                    const packet = new Uint8Array(1 + idBytes.length + chunkData.length);
+                    packet[0] = idBytes.length;
+                    packet.set(idBytes, 1);
+                    packet.set(chunkData, 1 + idBytes.length);
+
+                    channel.send(packet);
+
+                    offset += chunkData.length;
 
                     const progress = (offset / file.size) * 100;
                     this.updateTransferProgress(transferId, progress);
 
-                    // Log progress for large files
-                    if (chunksSent % 100 === 0) {
-                        console.log(`Progress: ${Math.round(progress)}% (${chunksSent}/${totalChunks} chunks)`);
-                    }
-
-                    // Continue sending with small delay to prevent overwhelming the channel
                     if (offset < file.size) {
-                        // For large files, add a tiny delay to prevent buffer overflow
-                        if (file.size > 100 * 1024 * 1024) { // > 100MB
-                            setTimeout(sendNextChunk, 1);
-                        } else {
-                            sendNextChunk();
-                        }
+                        // Parallel-friendly scheduling
+                        setTimeout(sendNextChunk, 0);
                     } else {
                         this.updateTransferStatus(transferId, 'completed');
                         this.showNotification('Transfer Complete', `${file.name} sent successfully`);
@@ -514,20 +649,16 @@ class FileSharingApp {
                 } catch (error) {
                     console.error('Error sending chunk:', error);
                     this.updateTransferStatus(transferId, 'error');
-                    this.showNotification('Transfer Error', 'Failed to send file');
                 }
             };
 
             reader.onerror = () => {
-                console.error('Error reading file');
                 this.updateTransferStatus(transferId, 'error');
-                this.showNotification('Transfer Error', 'Failed to read file');
             };
 
             reader.readAsArrayBuffer(slice);
         };
 
-        // Start sending
         sendNextChunk();
     }
 
@@ -580,10 +711,10 @@ class FileSharingApp {
             const peer = this.peers.get(t.peerId);
             const peerName = peer ? peer.name : 'Unknown';
             const direction = t.direction === 'outgoing' ? 'to' : 'from';
-            
+
             let statusIcon = '↻';
             let statusLabel = t.direction === 'outgoing' ? 'Sending' : 'Receiving';
-            
+
             if (t.status === 'completed') {
                 statusIcon = '✓';
                 statusLabel = 'Complete';
@@ -594,7 +725,7 @@ class FileSharingApp {
                 statusIcon = '✗';
                 statusLabel = 'Failed';
             }
-            
+
             return `
                 <div class="transfer-item">
                     <div class="transfer-info">
@@ -622,11 +753,16 @@ class FileSharingApp {
     }
 
     showFileIncomingModal(data) {
-        // Close any existing modal
-        if (this.activeModal) {
-            this.activeModal.remove();
+        this.incomingQueue.push(data);
+        if (!this.activeModal) {
+            this.processIncomingQueue();
         }
+    }
 
+    async processIncomingQueue() {
+        if (this.incomingQueue.length === 0) return;
+
+        const data = this.incomingQueue[0];
         const peer = this.peers.get(data.senderId) || data.senderInfo;
         const peerName = peer ? peer.name : 'Unknown Device';
 
@@ -678,18 +814,29 @@ class FileSharingApp {
         this.renderTransfers();
 
         // Handle accept
-        document.getElementById('acceptBtn').onclick = () => {
+        document.getElementById('acceptBtn').onclick = async () => {
+            // Check if we already have chunks for this file
+            const existingChunks = await this.storage.getProgress(data.transferId);
+            const resOffset = existingChunks * this.CHUNK_SIZE;
+
             this.socket.emit('file-accept', {
                 senderId: data.senderId,
-                transferId: data.transferId
+                transferId: data.transferId,
+                resOffset
             });
 
             // Update transfer status
             this.updateTransferStatus(data.transferId, 'receiving');
-            
-            this.showNotification('Transfer Starting', `Receiving ${data.fileName}...`);
+
+            if (resOffset > 0) {
+                this.showNotification('Resuming Transfer', `Resuming ${data.fileName} from ${this.formatFileSize(resOffset)}...`);
+            } else {
+                this.showNotification('Transfer Starting', `Receiving ${data.fileName}...`);
+            }
             modal.remove();
             this.activeModal = null;
+            this.incomingQueue.shift();
+            this.processIncomingQueue();
         };
 
         // Handle reject
@@ -702,10 +849,12 @@ class FileSharingApp {
 
             // Remove from transfers
             this.removeTransfer(data.transferId);
-            
+
             this.showNotification('File Declined', `Declined ${data.fileName}`);
             modal.remove();
             this.activeModal = null;
+            this.incomingQueue.shift();
+            this.processIncomingQueue();
         };
 
         // Close on background click
