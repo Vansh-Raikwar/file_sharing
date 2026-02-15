@@ -1,7 +1,7 @@
 class Storage {
     constructor() {
         this.dbName = 'FileSharingDB';
-        this.dbVersion = 1;
+        this.dbVersion = 2;
         this.db = null;
     }
 
@@ -16,7 +16,8 @@ class Storage {
             request.onupgradeneeded = (event) => {
                 const db = event.target.result;
                 if (!db.objectStoreNames.contains('chunks')) {
-                    db.createObjectStore('chunks', { keyPath: 'id' });
+                    const store = db.createObjectStore('chunks', { keyPath: 'id' });
+                    store.createIndex('transferId', 'transferId', { unique: false });
                 }
             };
         });
@@ -37,14 +38,13 @@ class Storage {
         return new Promise((resolve, reject) => {
             const transaction = this.db.transaction(['chunks'], 'readonly');
             const store = transaction.objectStore('chunks');
-            const request = store.openCursor();
+            const index = store.index('transferId');
+            const request = index.openCursor(IDBKeyRange.only(transferId));
             const chunks = [];
             request.onsuccess = (event) => {
                 const cursor = event.target.result;
                 if (cursor) {
-                    if (cursor.value.transferId === transferId) {
-                        chunks.push(cursor.value);
-                    }
+                    chunks.push(cursor.value);
                     cursor.continue();
                 } else {
                     resolve(chunks.sort((a, b) => a.chunkIndex - b.chunkIndex).map(c => c.data));
@@ -58,13 +58,12 @@ class Storage {
         return new Promise((resolve, reject) => {
             const transaction = this.db.transaction(['chunks'], 'readwrite');
             const store = transaction.objectStore('chunks');
-            const request = store.openCursor();
+            const index = store.index('transferId');
+            const request = index.openKeyCursor(IDBKeyRange.only(transferId));
             request.onsuccess = (event) => {
                 const cursor = event.target.result;
                 if (cursor) {
-                    if (cursor.value.transferId === transferId) {
-                        store.delete(cursor.key);
-                    }
+                    store.delete(cursor.primaryKey);
                     cursor.continue();
                 } else {
                     resolve();
@@ -78,19 +77,9 @@ class Storage {
         return new Promise((resolve, reject) => {
             const transaction = this.db.transaction(['chunks'], 'readonly');
             const store = transaction.objectStore('chunks');
-            const request = store.openCursor();
-            let count = 0;
-            request.onsuccess = (event) => {
-                const cursor = event.target.result;
-                if (cursor) {
-                    if (cursor.value.transferId === transferId) {
-                        count++;
-                    }
-                    cursor.continue();
-                } else {
-                    resolve(count);
-                }
-            };
+            const index = store.index('transferId');
+            const request = index.count(IDBKeyRange.only(transferId));
+            request.onsuccess = () => resolve(request.result);
             request.onerror = () => reject(request.error);
         });
     }
@@ -397,10 +386,8 @@ class FileSharingApp {
     }
 
     setupDataChannel(channel, peerId) {
-        let receivedBuffer = [];
-        let receivedSize = 0;
+        channel.binaryType = 'arraybuffer';
         let fileMetadata = null;
-        let transferAccepted = false;
 
         channel.onopen = () => {
             console.log('Data channel opened with', peerId);
@@ -448,10 +435,13 @@ class FileSharingApp {
 
                 const incoming = this.incomingChunks.get(transferId);
                 if (incoming) {
-                    const chunkIndex = Math.floor(incoming.receivedSize / this.CHUNK_SIZE);
+                    // Update size synchronously to avoid race condition
+                    const currentOffset = incoming.receivedSize;
+                    incoming.receivedSize += chunkData.byteLength;
+
+                    const chunkIndex = Math.floor(currentOffset / this.CHUNK_SIZE);
                     await this.storage.saveChunk(transferId, chunkIndex, chunkData);
 
-                    incoming.receivedSize += chunkData.byteLength;
                     const progress = (incoming.receivedSize / incoming.metadata.size) * 100;
                     this.updateTransferProgress(transferId, progress);
 
@@ -548,10 +538,9 @@ class FileSharingApp {
             return;
         }
 
-        // Generate unique signature for resumption (name + size)
-        // Add timestamp to ensure unique ID even if same file is sent 
-        const signature = btoa(file.name + file.size).substring(0, 16);
-        const transferId = signature + '-' + Date.now().toString(36);
+        // Generate stable signature for resumption (name + size + lastModified)
+        const signature = btoa(file.name + file.size + (file.lastModified || '')).substring(0, 24);
+        const transferId = signature;
 
         // Notify recipient about incoming file (requires acceptance)
         this.socket.emit('file-metadata', {
